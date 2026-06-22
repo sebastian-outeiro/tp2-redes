@@ -5,6 +5,7 @@ from pox.lib.addresses import EthAddr, IPAddr   # Address types
 from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.arp import arp
 from pox.lib.packet.ipv4 import ipv4
+import time
 
 log = core.getLogger()
 RED = "\033[31m"
@@ -26,21 +27,19 @@ PUBLIC_MAC = EthAddr("00:00:00:aa:aa:aa")   # MAC del router hacia la red públi
 PRIVATE_MAC = EthAddr("00:00:00:bb:bb:bb")  # MAC del router hacia la red privada
 PUBLIC_PORT = 1                             # Puerto del switch conectado a la red pública
 
-# H1_MAC = EthAddr("00:00:00:00:00:01")       # MAC del host externo
-
-TIMEOUT_SECONDS = 10
+FLOW_TIMEOUT_SECONDS = 10
+ARP_TIMEOUT_SECONDS  = FLOW_TIMEOUT_SECONDS
 
 NAT_PORT_START  = 1024
 NAT_PORT_END    = 65535
 
 class ProtoRouter(object):
 
-
     def __init__(self, connection):
         self.connection = connection
         connection.addListeners(self)
 
-        # Tabla ARP: IP -> MAC
+        # Tabla ARP: IP -> (MAC, timestamp)
         self.arp_table = {}
 
         # Paquetes en espera de resolución ARP: IP -> (Paquete, Puerto)
@@ -76,7 +75,7 @@ class ProtoRouter(object):
         elif event.parsed.type == ethernet.IP_TYPE:
             self.handle_ip(event)
         else:
-            log_color(YELLOW, f"Paquete ignorado: protocolo distinto de IPv4.")
+            log_color(YELLOW, f"Paquete ignorado: protocolo distinto de IPv4. {event.parsed.type}")
 
 
     def _handle_FlowRemoved(self, event):
@@ -118,8 +117,19 @@ class ProtoRouter(object):
 
     def _add_arp_entry(self, ip_address, mac_address):
         """Agrega o actualiza una entrada en la tabla ARP del controlador."""
-        self.arp_table[ip_address] = mac_address
+        self.arp_table[ip_address] = (mac_address, time.time())
         log_color(CYAN, f"ARP - Entrada Agregada: {ip_address} → {mac_address}")
+
+    def _get_arp_mac(self, ip_address):
+        """Retorna la MAC para una IP si existe y no expiró. Si expiró, elimina la entrada y retorna None."""
+        if ip_address not in self.arp_table:
+            return None
+        mac, timestamp = self.arp_table[ip_address]
+        if time.time() - timestamp > ARP_TIMEOUT_SECONDS:
+            del self.arp_table[ip_address]
+            log_color(YELLOW, f"ARP - Entrada expirada y eliminada: {ip_address}")
+            return None
+        return mac
 
     def _send_arp_reply(self, event, arp_request):
         """Responde un ARP Request con la MAC del router correspondiente."""
@@ -176,6 +186,10 @@ class ProtoRouter(object):
         self.connection.send(msg)
         log_color(CYAN, f"ARP Request enviado: ¿Quién tiene {target_ip}? → port {out_port}")
 
+    # -------------------------------------------------------------------------
+    # Gestión de paquetes para enviar
+    # -------------------------------------------------------------------------
+
     def _add_pending_packet(self, dst_ip, packet, in_port):
         """Encola un paquete en espera de resolución ARP para dst_ip."""
         if dst_ip not in self.pending_packets:
@@ -183,11 +197,20 @@ class ProtoRouter(object):
         self.pending_packets[dst_ip].append((packet, in_port))
 
     def _process_pending(self, ip):
-        """Procesa los paquetes pendientes cuando se aprende la MAC de una IP."""
+        """Procesa los paquetes pendientes asociados a una IP
+        En caso de que no haya paquetes pendientes para dicha IP, no se hace nada.
+        En el escenario que no se pueda obtener una MAC para dicha IP, no se hace nada.
+        (Se espera que esta función sea invocada posterior a obtener la MAC de una IP).
+        En el caas de que se dispone, se procesan todos los paquetes pendientes invocando _install_and_forward."""
         if ip not in self.pending_packets:
             return
+        destination_mac = self._get_arp_mac(ip)
+        if destination_mac is None:
+            # La entrada ARP expiró entre el Reply y el procesamiento (muy improbable, pero defensivo)
+            log_color(RED, f"ARP - Entrada expirada al procesar pendientes para {ip}. Paquetes descartados.")
+            self.pending_packets.pop(ip)
+            return
         pending_packages = self.pending_packets.pop(ip)
-        destination_mac = self.arp_table[ip]
         log_color(GREEN, f"Procesando {len(pending_packages)} paquete(s) pendiente(s) para {ip}")
         for (packet, in_port) in pending_packages:
             self._install_and_forward(packet, in_port, destination_mac)
@@ -249,8 +272,14 @@ class ProtoRouter(object):
         # Si la MAC del destino ya se conoce, se instalan los flujos y se reenvía el paquete actual.
         # Caso contrario, se debe primero conocer la MAC y luego enviar el paquete. (Se encola el paquete)
         if dst_ip in self.arp_table:
-            dst_mac = self.arp_table[dst_ip]
-            self._install_and_forward(packet, in_port, dst_mac)
+            dst_mac = self._get_arp_mac(dst_ip)
+            if dst_mac is not None:
+                self._install_and_forward(packet, in_port, dst_mac)
+            else:
+                # Entrada expirada: encolar y volver a preguntar
+                self._add_pending_packet(dst_ip, packet, in_port)
+                self._send_arp_request(dst_ip, PUBLIC_PORT, PUBLIC_IP, PUBLIC_MAC)
+                log_color(YELLOW, f"ARP expirado para {dst_ip}. Paquete encolado, ARP Request enviado.")
         else:
             self._add_pending_packet(dst_ip, packet, in_port)
             self._send_arp_request(dst_ip, PUBLIC_PORT, PUBLIC_IP, PUBLIC_MAC)
@@ -266,7 +295,7 @@ class ProtoRouter(object):
         """
         # Flujo Saliente
         fm = of.ofp_flow_mod()
-        fm.idle_timeout = TIMEOUT_SECONDS
+        fm.idle_timeout = FLOW_TIMEOUT_SECONDS
 
         # Filtro (Saliente)
         fm.match.nw_src  = origin_ip
@@ -283,7 +312,7 @@ class ProtoRouter(object):
 
         # Flujo Entrante
         fm_back = of.ofp_flow_mod()
-        fm_back.idle_timeout = TIMEOUT_SECONDS
+        fm_back.idle_timeout = FLOW_TIMEOUT_SECONDS
 
         # Filtro (Entrante). Se recibe un mensaje en la IP pública del router.
         fm_back.match.nw_src  = ip_pkt.dstip
